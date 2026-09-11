@@ -30,8 +30,26 @@ def db():
 def init_db():
     con = db()
     con.executescript("""
+    CREATE TABLE IF NOT EXISTS customer_requests (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        address TEXT NOT NULL,
+        material TEXT NOT NULL,
+        estimated_weight_kg REAL,
+        location_text TEXT,
+        lat REAL,
+        lng REAL,
+        photo_hash TEXT,
+        voice_transcript_text TEXT,
+        status TEXT NOT NULL DEFAULT 'PICKUP_REQUESTED',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS collections (
         id TEXT PRIMARY KEY,
+        request_id TEXT,
         collector_id TEXT NOT NULL,
         material TEXT NOT NULL,
         material_category TEXT NOT NULL,
@@ -89,12 +107,38 @@ def init_db():
 
     INSERT OR IGNORE INTO brand_targets VALUES ('BRAND001','2026-Q3',1000);
     """)
+    # Backward-compatible migration for databases created by earlier builds.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(collections)").fetchall()}
+    if "request_id" not in cols:
+        con.execute("ALTER TABLE collections ADD COLUMN request_id TEXT")
+    req_cols = {r[1] for r in con.execute("PRAGMA table_info(customer_requests)").fetchall()}
+    if "collection_id" not in req_cols:
+        con.execute("ALTER TABLE customer_requests ADD COLUMN collection_id TEXT")
+    if "collector_id" not in req_cols:
+        con.execute("ALTER TABLE customer_requests ADD COLUMN collector_id TEXT")
+    if "collector_assigned_at" not in req_cols:
+        con.execute("ALTER TABLE customer_requests ADD COLUMN collector_assigned_at TEXT")
+    if "collected_at" not in req_cols:
+        con.execute("ALTER TABLE customer_requests ADD COLUMN collected_at TEXT")
     con.commit()
     con.close()
 
 init_db()
 
+class CustomerRequestIn(BaseModel):
+    name: str = Field(min_length=1)
+    phone: str = Field(min_length=3)
+    address: str = Field(min_length=3)
+    material: str
+    estimated_weight_kg: Optional[float] = Field(default=None, gt=0)
+    location_text: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    photo_hash: Optional[str] = None
+    voice_transcript_text: Optional[str] = None
+
 class CollectionIn(BaseModel):
+    request_id: Optional[str] = None
     collector_id: str
     material: str
     material_category: str = "OTHER"
@@ -116,6 +160,12 @@ class RecyclerIn(BaseModel):
     collection_id: str
     recycler_id: str
     weight_kg: float = Field(gt=0)
+
+def next_customer_id():
+    con=db()
+    row=con.execute("SELECT COUNT(*) c FROM customer_requests").fetchone()
+    con.close()
+    return f"REQ-{1001 + row['c']}"
 
 def next_id():
     con=db()
@@ -140,18 +190,72 @@ def haversine(a,b,c,d):
 @app.get("/api/health")
 def health(): return {"ok": True, "service": "EcoTrace API"}
 
+@app.post("/api/customer/requests")
+def create_customer_request(x: CustomerRequestIn):
+    con=db()
+    rid=next_customer_id()
+    t=now()
+    con.execute("""INSERT INTO customer_requests
+    (id,name,phone,address,material,estimated_weight_kg,location_text,lat,lng,photo_hash,voice_transcript_text,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    (rid,x.name.strip(),x.phone.strip(),x.address.strip(),x.material,x.estimated_weight_kg,x.location_text,x.lat,x.lng,x.photo_hash,x.voice_transcript_text,"PICKUP_REQUESTED",t,t))
+    con.commit(); con.close()
+    return {"id":rid,"status":"PICKUP_REQUESTED","photo_hash_recorded":bool(x.photo_hash),"gps_recorded":x.lat is not None and x.lng is not None,"voice_recorded":bool(x.voice_transcript_text)}
+
+@app.get("/api/customer/requests")
+def customer_requests(phone=""):
+    con=db()
+    if phone:
+        rows=con.execute("SELECT * FROM customer_requests WHERE phone=? ORDER BY created_at DESC",(phone,)).fetchall()
+    else:
+        rows=con.execute("SELECT * FROM customer_requests ORDER BY created_at DESC").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+@app.get("/api/customer/trace/{request_id}")
+def customer_trace(request_id: str):
+    con=db()
+    req=con.execute("SELECT * FROM customer_requests WHERE id=?",(request_id,)).fetchone()
+    if not req:
+        con.close(); raise HTTPException(404,"Pickup request not found")
+    collection=None
+    if req["collection_id"]:
+        collection=con.execute("SELECT * FROM collections WHERE id=?",(req["collection_id"],)).fetchone()
+    elif req["id"]:
+        collection=con.execute("SELECT * FROM collections WHERE request_id=? ORDER BY created_at DESC LIMIT 1",(req["id"],)).fetchone()
+    events=[]
+    if collection:
+        events=[dict(r) for r in con.execute("SELECT * FROM audit_log WHERE collection_id=? ORDER BY id",(collection["id"],)).fetchall()]
+    con.close()
+    c=dict(collection) if collection else None
+    status=(c["status"] if c else req["status"])
+    return {"request":dict(req),"collection":c,"events":events,"status":status,"completed":status=="EPR_ELIGIBLE"}
+
+@app.get("/api/customer/pending")
+def customer_pending():
+    con=db(); rows=con.execute("SELECT * FROM customer_requests WHERE collection_id IS NULL ORDER BY created_at").fetchall(); con.close()
+    return [dict(r) for r in rows]
+
 @app.post("/api/collections")
 def create_collection(x: CollectionIn):
     con=db()
     cid=next_id()
     t=now()
+    if x.request_id:
+        req=con.execute("SELECT * FROM customer_requests WHERE id=?",(x.request_id,)).fetchone()
+        if not req:
+            con.close(); raise HTTPException(404,"Customer pickup request not found")
+        if req["collection_id"]:
+            con.close(); raise HTTPException(409,"This pickup request is already assigned")
     con.execute("""INSERT INTO collections
-    (id,collector_id,material,material_category,declared_weight_kg,location_text,lat,lng,photo_hash,voice_transcript_text,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-    (cid,x.collector_id,x.material,x.material_category,x.declared_weight_kg,x.location_text,x.lat,x.lng,x.photo_hash,x.voice_transcript_text,t,t))
-    add_audit(con,cid,"collector",x.collector_id,"collection_created",None,"COLLECTED")
+    (id,request_id,collector_id,material,material_category,declared_weight_kg,location_text,lat,lng,photo_hash,voice_transcript_text,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    (cid,x.request_id,x.collector_id,x.material,x.material_category,x.declared_weight_kg,x.location_text,x.lat,x.lng,x.photo_hash,x.voice_transcript_text,t,t))
+    add_audit(con,cid,"collector",x.collector_id,"collection_created",None,"COLLECTED", f"request_id={x.request_id}" if x.request_id else "")
+    if x.request_id:
+        con.execute("UPDATE customer_requests SET collection_id=?,collector_id=?,collector_assigned_at=?,collected_at=?,status='PICKUP_COLLECTED',updated_at=? WHERE id=?",(cid,x.collector_id,t,t,t,x.request_id))
     con.commit(); con.close()
-    return {"id":cid,"status":"COLLECTED"}
+    return {"id":cid,"status":"COLLECTED","request_id":x.request_id}
 
 @app.get("/api/collections/my")
 def my_collections(collector_id="C001"):
@@ -168,8 +272,11 @@ def confirm_agg(x: VerifyIn):
     con=db(); r=con.execute("SELECT * FROM collections WHERE id=?",(x.collection_id,)).fetchone()
     if not r: con.close(); raise HTTPException(404,"Collection not found")
     if r["status"]!="COLLECTED": con.close(); raise HTTPException(409,"Invalid state transition")
+    t=now()
     con.execute("""UPDATE collections SET aggregator_id=?,aggregator_weight_kg=?,aggregator_lat=?,aggregator_lng=?,aggregator_confirmed_at=?,status='AGGREGATOR_CONFIRMED',updated_at=? WHERE id=?""",
-                (x.aggregator_id,x.weight_kg,x.lat,x.lng,now(),now(),x.collection_id))
+                (x.aggregator_id,x.weight_kg,x.lat,x.lng,t,t,x.collection_id))
+    if r["request_id"]:
+        con.execute("UPDATE customer_requests SET status='AGGREGATOR_CONFIRMED',updated_at=? WHERE id=?",(t,r["request_id"]))
     add_audit(con,x.collection_id,"aggregator",x.aggregator_id,"confirm_pickup","COLLECTED","AGGREGATOR_CONFIRMED")
     con.commit(); con.close()
     return {"id":x.collection_id,"status":"AGGREGATOR_CONFIRMED"}
@@ -197,9 +304,12 @@ def receive(x: RecyclerIn):
     # Kept simple for MVP.
     status="FLAGGED" if flags else "EPR_ELIGIBLE"
     reason="+".join(flags) if flags else None
+    t=now()
     con.execute("""UPDATE collections SET recycler_id=?,recycler_weight_kg=?,recycler_confirmed_at=?,weight_variance_pct=?,flag_reason=?,status=?,epr_eligible_weight_kg=?,incentive_points=?,incentive_status=?,updated_at=? WHERE id=?""",
-        (x.recycler_id,x.weight_kg,now(),variance,reason,status,x.weight_kg if not flags else None,
-         x.weight_kg if not flags else 0,"EARNED" if not flags else "PENDING",now(),x.collection_id))
+        (x.recycler_id,x.weight_kg,t,variance,reason,status,x.weight_kg if not flags else None,
+         x.weight_kg if not flags else 0,"EARNED" if not flags else "PENDING",t,x.collection_id))
+    if r["request_id"]:
+        con.execute("UPDATE customer_requests SET status=?,updated_at=? WHERE id=?",(status,t,r["request_id"]))
     add_audit(con,x.collection_id,"recycler",x.recycler_id,"confirm_receipt","AGGREGATOR_CONFIRMED",status,
               f"variance_pct={variance:.2f};flag_reason={reason}")
     if not flags:
